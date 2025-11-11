@@ -62,7 +62,7 @@ TZ_MAP = {
     "UTC": "UTC",
     "GMT": "UTC",
     "BST": "Europe/London",
-    "JST": "Japan",
+    "JST": "Asia/Tokyo",
 }
 
 # “Important zones” for multi-display
@@ -83,6 +83,18 @@ TIME_PATTERN = re.compile(
 )
 
 # ------------- Utility Functions -------------
+def bot_can_delete(message: discord.Message) -> bool:
+    """Return True if the bot can delete messages in this channel."""
+    try:
+        if message.guild is None:
+            return False  # DMs: cannot manage messages
+        me = message.guild.me  # the bot's Member
+        if me is None:
+            return False
+        perms = message.channel.permissions_for(me)
+        return bool(perms.manage_messages)
+    except Exception:
+        return False
 
 
 def safe_zoneinfo(key: str) -> ZoneInfo:
@@ -186,12 +198,6 @@ def find_first_time_expr(content: str):
 
 
 async def try_auto_localize(message: discord.Message):
-    """
-    If message contains a time expression:
-      - convert the time
-      - delete the original message
-      - send the converted text
-    """
     info = find_first_time_expr(message.content)
     if not info:
         return
@@ -199,23 +205,27 @@ async def try_auto_localize(message: discord.Message):
     hh, mm = parse_time_token(info["hour"], info["min"], info["ampm"])
     src_dt = build_source_dt(hh, mm, info["tz"])
     if not src_dt:
-        await message.reply("Unknown timezone abbreviation", mention_author=False)
+        # silently ignore or notify – your call
         return
 
     replacement = to_discord_timestamp(src_dt, "t")
     rebuilt = (message.content[:info["span"][0]] + replacement +
                message.content[info["span"][1]:])
 
-    # Try deleting the user's message (requires Manage Messages permission)
-    try:
-        await message.delete()
-    except discord.Forbidden:
-        # Bot doesn't have permission → just send normally
-        await message.channel.send(rebuilt, allowed_mentions=allowed)
-        return
+    # Delete only if the bot has permission; otherwise just post the converted text
+    if bot_can_delete(message):
+        try:
+            await message.delete()
+        except (discord.Forbidden, discord.HTTPException):
+            # fall back if we lose perms or hit a transient error
+            pass
 
-    # Send the cleaned converted version
-    await message.channel.send(rebuilt, allowed_mentions=allowed)
+    # Send the converted version either way
+    try:
+        await message.channel.send(rebuilt, allowed_mentions=allowed)
+    except discord.HTTPException:
+        # swallow rare send failures
+        pass
 
 
 
