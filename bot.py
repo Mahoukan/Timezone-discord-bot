@@ -187,8 +187,10 @@ def find_first_time_expr(content: str):
 
 async def try_auto_localize(message: discord.Message):
     """
-    If message contains a time expression, reply with the same sentence but time replaced by a Discord timestamp.
-    e.g. "lets play at 12 nzdt" -> "lets play at <t:...:t>"
+    If message contains a time expression:
+      - convert the time
+      - delete the original message
+      - send the converted text
     """
     info = find_first_time_expr(message.content)
     if not info:
@@ -197,14 +199,24 @@ async def try_auto_localize(message: discord.Message):
     hh, mm = parse_time_token(info["hour"], info["min"], info["ampm"])
     src_dt = build_source_dt(hh, mm, info["tz"])
     if not src_dt:
-        await message.reply("Unknown timezone abbreviation",
-                            mention_author=False)
+        await message.reply("Unknown timezone abbreviation", mention_author=False)
         return
 
     replacement = to_discord_timestamp(src_dt, "t")
-    rebuilt = message.content[:info["span"][
-        0]] + replacement + message.content[info["span"][1]:]
-    await message.reply(rebuilt, mention_author=False)
+    rebuilt = (message.content[:info["span"][0]] + replacement +
+               message.content[info["span"][1]:])
+
+    # Try deleting the user's message (requires Manage Messages permission)
+    try:
+        await message.delete()
+    except discord.Forbidden:
+        # Bot doesn't have permission → just send normally
+        await message.channel.send(rebuilt, allowed_mentions=allowed)
+        return
+
+    # Send the cleaned converted version
+    await message.channel.send(rebuilt, allowed_mentions=allowed)
+
 
 
 # ------------- Commands -------------
