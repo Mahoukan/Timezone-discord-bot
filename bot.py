@@ -245,10 +245,15 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # Auto replace first time expr into a Discord timestamp sentence
+    # If this message is invoking a command, don't auto-localize it
+    ctx = await bot.get_context(message)
+    if ctx.valid:
+        await bot.process_commands(message)
+        return
+
+    # Otherwise, try auto-localize normal chatter
     await try_auto_localize(message)
 
-    await bot.process_commands(message)
 
 
 @bot.command(
