@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
+from discord import app_commands   # [SLASH] NEW
 
 # ------------- Config / Setup -------------
 
@@ -29,6 +30,9 @@ bot = commands.Bot(
     intents=intents,
     allowed_mentions=allowed,
 )
+
+# [SLASH] Optional: fast guild-only sync during development
+TEST_GUILD_ID = None  # put your server ID here for instant sync, else leave None
 
 # Remove default help to register our own
 bot.remove_command("help")
@@ -230,14 +234,25 @@ async def try_auto_localize(message: discord.Message):
 
 
 
-# ------------- Commands -------------
-
+# ------------- Commands (prefix + slash) -------------
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     load_events()
     scheduler_loop.start()
+
+    # [SLASH] Sync application commands
+    try:
+        if TEST_GUILD_ID:
+            guild = discord.Object(id=TEST_GUILD_ID)
+            await bot.tree.sync(guild=guild)
+            print(f"Slash commands synced to guild {TEST_GUILD_ID}")
+        else:
+            await bot.tree.sync()
+            print("Slash commands synced globally")
+    except Exception as e:
+        print(f"Slash sync failed: {e}")
 
 
 @bot.event
@@ -255,11 +270,13 @@ async def on_message(message: discord.Message):
     await try_auto_localize(message)
 
 
-
+# ---------- Prefix command: ~time ----------
 @bot.command(
     name="time",
-    help=
-    "Show current time in key zones, or convert a supplied time.\nUsage: ~time OR ~time 12 nzdt OR ~time 6:15 pm aedt",
+    help=(
+        "Show current time in key zones, or convert a supplied time.\n"
+        "Usage: ~time OR ~time 12 nzdt OR ~time 6:15 pm aedt"
+    ),
 )
 async def time_cmd(ctx: commands.Context, *, args: str = ""):
     args = args.strip()
@@ -288,8 +305,40 @@ async def time_cmd(ctx: commands.Context, *, args: str = ""):
     await ctx.reply(text, mention_author=False)
 
 
-# --------- Simple Event Scheduler (in-file) ---------
+# ---------- Slash command: /time  ----------  [SLASH] NEW
+@bot.tree.command(name="time", description="Show current times or convert e.g. '6:15 pm aedt'")
+@app_commands.describe(query="Optional time like '12 nzdt' or '6:15 pm aedt'. Leave blank to show current times.")
+async def slash_time(interaction: discord.Interaction, query: Optional[str] = None):
+    if not query:
+        src_dt = datetime.now(safe_zoneinfo("Pacific/Auckland"))
+        text = format_time_list_from(src_dt)
+        await interaction.response.send_message(text, allowed_mentions=allowed)
+        return
 
+    info = find_first_time_expr(query)
+    if not info:
+        await interaction.response.send_message(
+            "Could not find a time and timezone. Try: `12 nzdt` or `6:15 pm aedt`.",
+            allowed_mentions=allowed,
+            ephemeral=True
+        )
+        return
+
+    hh, mm = parse_time_token(info["hour"], info["min"], info["ampm"])
+    src_dt = build_source_dt(hh, mm, info["tz"])
+    if not src_dt:
+        await interaction.response.send_message(
+            "Unknown timezone abbreviation.",
+            allowed_mentions=allowed,
+            ephemeral=True
+        )
+        return
+
+    text = format_time_list_from(src_dt)
+    await interaction.response.send_message(text, allowed_mentions=allowed)
+
+
+# --------- Simple Event Scheduler (in-file) ---------
 
 @dataclass
 class ScheduledEvent:
@@ -366,8 +415,10 @@ def to_long_when(t: datetime) -> str:
 
 @bot.command(
     name="event",
-    help=
-    "Schedule an event with reminders.\nUsage: ~event 6:15 pm nzdt --name Valorant scrims [--thread]",
+    help=(
+        "Schedule an event with reminders.\n"
+        "Usage: ~event 6:15 pm nzdt --name Valorant scrims [--thread]"
+    ),
 )
 async def event_cmd(ctx: commands.Context, *, args: str):
     info = find_first_time_expr(args)
@@ -428,6 +479,65 @@ async def event_cmd(ctx: commands.Context, *, args: str):
     )
 
 
+# ---------- Slash command: /event  ----------  [SLASH] NEW
+@bot.tree.command(name="event", description="Schedule an event with reminders.")
+@app_commands.describe(
+    time_text="Time like '6:15 pm nzdt' or '19:00 aedt'",
+    name="Event name",
+    thread="Create a thread for the event"
+)
+async def slash_event(
+    interaction: discord.Interaction,
+    time_text: str,
+    name: str,
+    thread: Optional[bool] = False
+):
+    info = find_first_time_expr(time_text)
+    if not info:
+        await interaction.response.send_message(
+            "Could not find a time+timezone. Try: `6:15 pm nzdt`",
+            ephemeral=True
+        )
+        return
+
+    hh, mm = parse_time_token(info["hour"], info["min"], info["ampm"])
+    src_dt = build_source_dt(hh, mm, info["tz"])
+    if not src_dt:
+        await interaction.response.send_message("Unknown timezone abbreviation.", ephemeral=True)
+        return
+
+    # Create a record
+    channel_id = interaction.channel.id if interaction.channel else 0
+    guild_id = interaction.guild.id if interaction.guild else 0
+    ev = register_event(
+        guild_id=guild_id,
+        channel_id=channel_id,
+        creator_id=interaction.user.id,
+        name=name,
+        start_dt=src_dt,
+        message_id=None,
+    )
+
+    # Optionally create a thread
+    thread_line = ""
+    if thread and hasattr(interaction.channel, "create_thread"):
+        try:
+            # need a message to attach a thread to; send an initial message
+            msg = await interaction.channel.send(
+                f"Thread for **{ev.name}** — starts {to_long_when(src_dt)}"
+            )
+            th = await interaction.channel.create_thread(name=name, message=msg)
+            ev.thread_id = th.id
+            save_events()
+            thread_line = f"\nThread: <#{th.id}>"
+        except Exception:
+            thread_line = "\n(Unable to create thread.)"
+
+    await interaction.response.send_message(
+        f"Scheduled **{ev.name}** for {to_long_when(src_dt)}. ID `{ev.id}`.{thread_line}"
+    )
+
+
 def parse_event_id(arg: str) -> Optional[int]:
     """Robust int parsing for event IDs to avoid BadArgument errors."""
     if not arg:
@@ -473,6 +583,33 @@ async def cancel_cmd(ctx: commands.Context, *, arg: str = ""):
                     mention_author=False)
 
 
+# ---------- Slash command: /cancel  ----------  [SLASH] NEW
+@bot.tree.command(name="cancel", description="Cancel an event by ID, e.g. /cancel 12")
+@app_commands.describe(event_id="Numeric event ID")
+async def slash_cancel(interaction: discord.Interaction, event_id: int):
+    idx = next((i for i, e in enumerate(_EVENTS) if e.id == event_id), None)
+    if idx is None:
+        await interaction.response.send_message("No such event ID.", ephemeral=True)
+        return
+
+    ev = _EVENTS[idx]
+
+    # simple permission gate like prefix version
+    allowed = (interaction.user.id == ev.creator_id)
+    if hasattr(interaction.user, "guild_permissions"):
+        allowed = allowed or interaction.user.guild_permissions.manage_messages
+
+    if not allowed:
+        await interaction.response.send_message(
+            "Only the creator or a moderator can cancel this event.", ephemeral=True
+        )
+        return
+
+    _EVENTS.pop(idx)
+    save_events()
+    await interaction.response.send_message(f"Cancelled event `{event_id}` (**{ev.name}**).")
+
+
 @bot.command(name="events", help="List scheduled events.")
 async def events_cmd(ctx: commands.Context):
     if not _EVENTS:
@@ -497,6 +634,31 @@ async def events_cmd(ctx: commands.Context):
     await ctx.reply("\n".join(lines), mention_author=False)
 
 
+# ---------- Slash command: /events  ----------  [SLASH] NEW
+@bot.tree.command(name="events", description="List upcoming events.")
+async def slash_events(interaction: discord.Interaction):
+    if not _EVENTS:
+        await interaction.response.send_message("No upcoming events.")
+        return
+
+    now = datetime.now(timezone.utc).timestamp()
+    upcoming = sorted([e for e in _EVENTS if e.start_utc >= now - 60],
+                      key=lambda x: x.start_utc)
+    if not upcoming:
+        await interaction.response.send_message("No upcoming events.")
+        return
+
+    lines = []
+    for e in upcoming:
+        start_dt = datetime.fromtimestamp(
+            e.start_utc,
+            tz=timezone.utc).astimezone(safe_zoneinfo("Pacific/Auckland"))
+        lines.append(
+            f"ID `{e.id}` — **{e.name}** — {to_long_when(start_dt)} in <#{e.channel_id}>"
+        )
+    await interaction.response.send_message("\n".join(lines))
+
+
 @bot.command(name="help", help="Show help.")
 async def help_cmd(ctx: commands.Context):
     txt = (
@@ -504,25 +666,23 @@ async def help_cmd(ctx: commands.Context):
         "\n"
         "__Auto-localize__: type a message like `lets play at 12 nzdt` and I will reply with the same sentence but with a localized time.\n"
         "\n"
-        "__~time__\n"
-        "`~time` → show current times in NZ, Sydney, Brisbane, Perth, LA, NY, London.\n"
-        "`~time 12 nzdt` or `~time 6:15 pm aedt` → convert that time across those zones.\n"
+        "__~time / /time__\n"
+        "`~time` or `/time` → show current times in NZ, Sydney, Brisbane, Perth, LA, NY, London.\n"
+        "`~time 12 nzdt` or `/time query: 6:15 pm aedt` → convert across those zones.\n"
         "\n"
-        "__~event__\n"
-        "`~event 6:15 pm nzdt --name Valorant scrims [--thread]` → schedule an event.\n"
-        "I post reminders at 30 minutes and 15 minutes before start, and at start time.\n"
-        "`~events` → list upcoming events.\n"
-        "`~cancel <id>` → cancel a scheduled event.\n"
+        "__~event / /event__\n"
+        "`~event 6:15 pm nzdt --name Valorant scrims [--thread]` or `/event time_text:\"6:15 pm nzdt\" name:\"Valorant scrims\" thread:true`.\n"
+        "`~events` or `/events` → list upcoming events.\n"
+        "`~cancel <id>` or `/cancel <id>` → cancel a scheduled event.\n"
         "\n"
         "Notes:\n"
-        "- Timezones understood: NZDT/NZST, AEDT/AEST, ACDT/ACST, AWST, PST/PDT, MST/MDT, CST/CDT, EST/EDT, UTC/GMT, BST.\n"
+        "- Timezones understood: NZDT/NZST, AEDT/AEST, ACDT/ACST, AWST, PST/PDT, MST/MDT, CST/CDT, EST/EDT, UTC/GMT, BST, JST.\n"
         "- If time zones are missing on Windows, install tz data once: `pip install tzdata`.\n"
         "- Bot messages will not ping `@everyone`/`@here`/users/roles.\n")
     await ctx.reply(txt, mention_author=False)
 
 
 # ------------- Background Scheduler -------------
-
 
 @tasks.loop(seconds=30)
 async def scheduler_loop():
