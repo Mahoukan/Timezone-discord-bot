@@ -19,10 +19,6 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 
 # Prevent accidental pings in all bot messages
 allowed = discord.AllowedMentions(
-    everyone=False,
-    users=False,
-    roles=False,
-    replied_user=False,
 )
 
 intents = discord.Intents.default()
